@@ -40,6 +40,14 @@ func (c *Client) ListContainers(ctx context.Context) ([]Container, error) {
 	}
 	out := make([]Container, 0, len(result.Items))
 	for _, r := range result.Items {
+		ports := make([]ContainerPort, 0, len(r.Ports))
+		for _, p := range r.Ports {
+			ports = append(ports, ContainerPort{
+				Private:  p.PrivatePort,
+				Public:   p.PublicPort,
+				Protocol: p.Type,
+			})
+		}
 		out = append(out, Container{
 			ID:     r.ID,
 			Names:  r.Names,
@@ -47,6 +55,7 @@ func (c *Client) ListContainers(ctx context.Context) ([]Container, error) {
 			State:  string(r.State),
 			Status: r.Status,
 			Labels: r.Labels,
+			Ports:  ports,
 		})
 	}
 	return out, nil

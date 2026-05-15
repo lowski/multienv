@@ -1,6 +1,7 @@
 // Package reconciler converges the actual state of the local Docker
-// daemon toward the state multienv expects: a shared network exists and
-// every multienv service is attached to it.
+// daemon toward the state multienv expects: a shared network exists,
+// every multienv service is attached to it, and every registered
+// accessory is reconciled against the services that request it.
 //
 // Reconcile is safe to call repeatedly. Each call is a one-shot pass; a
 // future daemon can drive it from Docker events without changes here.
@@ -12,7 +13,9 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/lowski/multienv/internal/accessory"
 	"github.com/lowski/multienv/internal/docker"
+	"github.com/lowski/multienv/internal/labels"
 	"github.com/lowski/multienv/internal/service"
 )
 
@@ -24,40 +27,45 @@ const NetworkName = "multienv"
 const ManagedLabel = "multienv.managed"
 
 // DockerAPI is the slice of [docker.Client] the reconciler relies on.
-// It is kept narrow so tests can substitute a fake.
-type DockerAPI interface {
-	ListContainers(ctx context.Context) ([]docker.Container, error)
-	NetworkInspect(ctx context.Context, name string) (*docker.Network, error)
-	NetworkCreate(ctx context.Context, spec docker.NetworkSpec) (string, error)
-	NetworkConnect(ctx context.Context, networkID, containerID string) error
-}
+// It mirrors [accessory.DockerAPI] so accessories and the reconciler
+// share one fake in tests.
+type DockerAPI = accessory.DockerAPI
 
 // Reconciler runs a single reconciliation pass over the Docker daemon.
 type Reconciler struct {
-	Docker DockerAPI
-	Out    io.Writer
-	DryRun bool
+	Docker      DockerAPI
+	Accessories *accessory.Registry
+	Out         io.Writer
+	DryRun      bool
 	// Color enables ANSI color in the prefix tags. The CLI sets this
 	// based on whether stdout is a TTY; tests leave it off.
 	Color bool
 }
 
-// Reconcile runs every reconciliation step. Per-service failures are
-// collected so one bad service does not block the others; the joined
-// error is returned at the end.
+// Reconcile runs every reconciliation step. Per-step failures are
+// collected so one bad step does not block the others.
 func (r *Reconciler) Reconcile(ctx context.Context) error {
 	netID, attached, err := r.ensureNetwork(ctx)
 	if err != nil {
 		return err
 	}
-	return r.attachServices(ctx, netID, attached)
+	containers, err := r.Docker.ListContainers(ctx)
+	if err != nil {
+		return fmt.Errorf("list containers: %w", err)
+	}
+	services := service.FromContainers(containers)
+
+	var errs []error
+	if err := r.attachServices(ctx, netID, attached, services); err != nil {
+		errs = append(errs, err)
+	}
+	if err := r.reconcileAccessories(ctx, netID, containers, services); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
-// ensureNetwork makes sure the shared multienv network exists. It
-// returns the network ID and the set of container IDs already attached
-// to it. In dry-run mode, when the network does not yet exist, it
-// returns an empty ID and an empty attached set so the caller can still
-// describe the work it would do.
+// ensureNetwork makes sure the shared multienv network exists.
 func (r *Reconciler) ensureNetwork(ctx context.Context) (string, map[string]struct{}, error) {
 	net, err := r.Docker.NetworkInspect(ctx, NetworkName)
 	if err == nil {
@@ -88,13 +96,7 @@ func (r *Reconciler) ensureNetwork(ctx context.Context) (string, map[string]stru
 
 // attachServices connects every multienv service that is not already
 // attached to the shared network.
-func (r *Reconciler) attachServices(ctx context.Context, netID string, attached map[string]struct{}) error {
-	containers, err := r.Docker.ListContainers(ctx)
-	if err != nil {
-		return fmt.Errorf("list containers: %w", err)
-	}
-	services := service.FromContainers(containers)
-
+func (r *Reconciler) attachServices(ctx context.Context, netID string, attached map[string]struct{}, services []service.Service) error {
 	var errs []error
 	for _, s := range services {
 		if _, ok := attached[s.ContainerID]; ok {
@@ -118,14 +120,70 @@ func (r *Reconciler) attachServices(ctx context.Context, netID string, attached 
 	return nil
 }
 
+// reconcileAccessories drives each registered accessory: it collects
+// per-service config requests from labels and hands them off, with a
+// prefix-bound logger so accessory output flows through the
+// [accessory <name>] channel.
+func (r *Reconciler) reconcileAccessories(ctx context.Context, netID string, containers []docker.Container, services []service.Service) error {
+	if r.Accessories == nil {
+		return nil
+	}
+	labelsByID := indexLabels(containers)
+
+	var errs []error
+	for _, acc := range r.Accessories.All() {
+		reqs := r.collectRequests(acc.Name(), services, labelsByID)
+		env := r.accessoryEnv(acc.Name(), netID)
+		if err := acc.Reconcile(ctx, env, reqs); err != nil {
+			r.logAccessory(acc.Name(), "FAILED: %v", err)
+			errs = append(errs, fmt.Errorf("%s: %w", acc.Name(), err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("reconcile accessories: %w", errors.Join(errs...))
+	}
+	return nil
+}
+
+func (r *Reconciler) collectRequests(name string, services []service.Service, labelsByID map[string]map[string]string) []accessory.ServiceRequest {
+	var out []accessory.ServiceRequest
+	for _, s := range services {
+		cfg := labels.ForAccessory(labelsByID[s.ContainerID], name)
+		if cfg == nil {
+			continue
+		}
+		out = append(out, accessory.ServiceRequest{Service: s, Config: cfg})
+	}
+	return out
+}
+
+func (r *Reconciler) accessoryEnv(name, netID string) accessory.Env {
+	return accessory.Env{
+		Docker:    r.Docker,
+		NetworkID: netID,
+		Network:   NetworkName,
+		DryRun:    r.DryRun,
+		Log: func(format string, args ...any) {
+			r.logAccessory(name, format, args...)
+		},
+	}
+}
+
+func indexLabels(containers []docker.Container) map[string]map[string]string {
+	out := make(map[string]map[string]string, len(containers))
+	for _, c := range containers {
+		out[c.ID] = c.Labels
+	}
+	return out
+}
+
 // --- log channels ---------------------------------------------------------
 
-// ANSI colors are kept simple; they apply only to the bracket-prefix tag.
-// Future accessory channel: magenta (35).
 const (
 	ansiReset      = "\x1b[0m"
 	colorHousekeep = "\x1b[36m" // cyan
 	colorService   = "\x1b[32m" // green
+	colorAccessory = "\x1b[35m" // magenta
 )
 
 func (r *Reconciler) logHousekeeping(format string, args ...any) {
@@ -134,6 +192,10 @@ func (r *Reconciler) logHousekeeping(format string, args ...any) {
 
 func (r *Reconciler) logService(s service.Service, format string, args ...any) {
 	r.writeLine(colorService, fmt.Sprintf("[service %s]", displayName(s)), format, args...)
+}
+
+func (r *Reconciler) logAccessory(name, format string, args ...any) {
+	r.writeLine(colorAccessory, fmt.Sprintf("[accessory %s]", name), format, args...)
 }
 
 func (r *Reconciler) writeLine(color, prefix, format string, args ...any) {

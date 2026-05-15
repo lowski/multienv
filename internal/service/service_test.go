@@ -35,11 +35,12 @@ func TestFromContainer_UsesComposeMetadata(t *testing.T) {
 		t.Fatal("expected service to be recognized")
 	}
 	want := Service{
-		Project:     "myapp",
-		Name:        "api",
-		State:       "running",
-		Status:      "Up 3 hours",
-		Accessories: []string{"postgres", "proxy"},
+		ContainerName: "myapp-api-1",
+		Project:       "myapp",
+		Name:          "api",
+		State:         "running",
+		Status:        "Up 3 hours",
+		Accessories:   []string{"postgres", "proxy"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %+v, want %+v", got, want)

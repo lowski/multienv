@@ -7,25 +7,26 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/lowski/multienv/internal/accessory"
 	"github.com/lowski/multienv/internal/docker"
 	"github.com/lowski/multienv/internal/reconciler"
 )
 
-func newReconcileCmd() *cobra.Command {
+func newReconcileCmd(reg *accessory.Registry) *cobra.Command {
 	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "reconcile",
 		Short: "Reconcile the local Docker state to match multienv expectations",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runReconcile(cmd.Context(), cmd.OutOrStdout(), dryRun)
+			return runReconcile(cmd.Context(), cmd.OutOrStdout(), dryRun, reg)
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "describe planned actions without performing them")
 	return cmd
 }
 
-func runReconcile(ctx context.Context, out io.Writer, dryRun bool) error {
+func runReconcile(ctx context.Context, out io.Writer, dryRun bool, reg *accessory.Registry) error {
 	dc, err := docker.New()
 	if err != nil {
 		return err
@@ -33,10 +34,11 @@ func runReconcile(ctx context.Context, out io.Writer, dryRun bool) error {
 	defer dc.Close()
 
 	r := &reconciler.Reconciler{
-		Docker: dc,
-		Out:    out,
-		DryRun: dryRun,
-		Color:  isTerminal(out),
+		Docker:      dc,
+		Accessories: reg,
+		Out:         out,
+		DryRun:      dryRun,
+		Color:       isTerminal(out),
 	}
 	return r.Reconcile(ctx)
 }

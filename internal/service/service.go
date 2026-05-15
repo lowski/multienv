@@ -13,6 +13,11 @@ type Service struct {
 	// ContainerID is the underlying Docker container ID.
 	ContainerID string
 
+	// ContainerName is the container's primary name (without the leading
+	// slash). It is the hostname other containers on the multienv
+	// network use to reach this service.
+	ContainerName string
+
 	// Project is the Docker Compose project the container belongs to,
 	// or empty if the container is not part of a compose project.
 	Project string
@@ -27,6 +32,10 @@ type Service struct {
 	// Status is the human-readable status string from the daemon.
 	Status string
 
+	// Ports are the container's known ports, useful for accessories
+	// (e.g. the proxy resolving an upstream port).
+	Ports []docker.ContainerPort
+
 	// Accessories are the multienv accessory types this service requests
 	// via its labels, sorted alphabetically.
 	Accessories []string
@@ -39,12 +48,14 @@ func FromContainer(c docker.Container) (Service, bool) {
 		return Service{}, false
 	}
 	return Service{
-		ContainerID: c.ID,
-		Project:     c.Labels[labels.ComposeProject],
-		Name:        serviceName(c),
-		State:       c.State,
-		Status:      c.Status,
-		Accessories: labels.Accessories(c.Labels),
+		ContainerID:   c.ID,
+		ContainerName: c.PrimaryName(),
+		Project:       c.Labels[labels.ComposeProject],
+		Name:          serviceName(c),
+		State:         c.State,
+		Status:        c.Status,
+		Ports:         c.Ports,
+		Accessories:   labels.Accessories(c.Labels),
 	}, true
 }
 

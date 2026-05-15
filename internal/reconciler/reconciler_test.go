@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
+	"github.com/lowski/multienv/internal/accessory"
 	"github.com/lowski/multienv/internal/docker"
 )
 
@@ -21,6 +23,23 @@ type fakeDocker struct {
 	createErr    error
 	connectErr   map[string]error // keyed by container ID
 }
+
+// Container-lifecycle methods exist only to satisfy the wider DockerAPI
+// interface; the reconciler tests in this file do not exercise them.
+func (*fakeDocker) ContainerInspect(context.Context, string) (*docker.Container, error) {
+	return nil, docker.ErrNotFound
+}
+func (*fakeDocker) ContainerCreate(context.Context, docker.ContainerSpec) (string, error) {
+	return "", nil
+}
+func (*fakeDocker) ContainerStart(context.Context, string) error { return nil }
+func (*fakeDocker) ContainerExec(context.Context, string, []string, io.Reader, io.Writer) error {
+	return nil
+}
+func (*fakeDocker) ContainerCopyFrom(context.Context, string, string, io.Writer) error {
+	return nil
+}
+func (*fakeDocker) ImagePull(context.Context, string) error { return nil }
 
 type connectCall struct {
 	networkID, containerID string
@@ -168,6 +187,101 @@ func TestReconcile_DryRunDoesNothing(t *testing.T) {
 	}
 	if !strings.Contains(log, "[service myapp/api] would attach") {
 		t.Errorf("dry-run log missing service line: %s", log)
+	}
+}
+
+// fakeAccessory records the requests handed to it for assertions.
+type fakeAccessory struct {
+	name        string
+	gotRequests []accessory.ServiceRequest
+	err         error
+}
+
+func (f *fakeAccessory) Name() string                                    { return f.name }
+func (f *fakeAccessory) ConfigSchema() map[string]accessory.ConfigOption { return nil }
+func (f *fakeAccessory) Commands() []accessory.Command                   { return nil }
+func (f *fakeAccessory) Reconcile(_ context.Context, env accessory.Env, reqs []accessory.ServiceRequest) error {
+	f.gotRequests = reqs
+	env.Log("saw %d request(s)", len(reqs))
+	return f.err
+}
+
+func TestReconcile_DispatchesAccessoryRequestsFromLabels(t *testing.T) {
+	t.Parallel()
+	fd := &fakeDocker{
+		network: &docker.Network{
+			ID:                   "net-multienv",
+			Name:                 NetworkName,
+			AttachedContainerIDs: map[string]struct{}{"c-api": {}, "c-worker": {}},
+		},
+		containers: []docker.Container{
+			{
+				ID:    "c-api",
+				Names: []string{"/myapp-api-1"},
+				Labels: map[string]string{
+					"com.docker.compose.project": "myapp",
+					"com.docker.compose.service": "api",
+					"multienv.proxy.domain":      "api.example.com",
+					"multienv.proxy.port":        "3000",
+				},
+			},
+			{
+				ID:    "c-worker",
+				Names: []string{"/myapp-worker-1"},
+				Labels: map[string]string{
+					"com.docker.compose.project": "myapp",
+					"com.docker.compose.service": "worker",
+					"multienv.postgres.dbname":   "myapp", // not proxy — should be filtered out
+				},
+			},
+		},
+	}
+	fa := &fakeAccessory{name: "proxy"}
+	reg := accessory.NewRegistry()
+	reg.Register(fa)
+
+	var out bytes.Buffer
+	r := &Reconciler{Docker: fd, Accessories: reg, Out: &out}
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(fa.gotRequests) != 1 {
+		t.Fatalf("accessory got %d requests, want 1", len(fa.gotRequests))
+	}
+	got := fa.gotRequests[0]
+	if got.Service.ContainerID != "c-api" {
+		t.Errorf("request container = %q, want c-api", got.Service.ContainerID)
+	}
+	if got.Config["domain"] != "api.example.com" || got.Config["port"] != "3000" {
+		t.Errorf("request config = %v, want domain/port from labels", got.Config)
+	}
+	if !strings.Contains(out.String(), "[accessory proxy] saw 1 request") {
+		t.Errorf("expected [accessory proxy] line in output, got: %s", out.String())
+	}
+}
+
+func TestReconcile_AccessoryErrorIsSurfaced(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("proxy failed")
+	fa := &fakeAccessory{name: "proxy", err: boom}
+	reg := accessory.NewRegistry()
+	reg.Register(fa)
+
+	fd := &fakeDocker{
+		network: &docker.Network{
+			ID:                   "net-multienv",
+			Name:                 NetworkName,
+			AttachedContainerIDs: map[string]struct{}{},
+		},
+		containers: []docker.Container{
+			multienvContainer("c-api", "myapp", "api"),
+		},
+	}
+	r := &Reconciler{Docker: fd, Accessories: reg, Out: &bytes.Buffer{}}
+	err := r.Reconcile(context.Background())
+	if !errors.Is(err, boom) {
+		t.Errorf("err = %v, want wrap of boom", err)
 	}
 }
 

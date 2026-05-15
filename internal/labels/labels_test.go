@@ -29,6 +29,30 @@ func TestHasMultienv(t *testing.T) {
 	}
 }
 
+func TestForAccessory(t *testing.T) {
+	t.Parallel()
+	in := map[string]string{
+		"multienv.proxy.domain":      "app.example.com",
+		"multienv.proxy.port":        "3000",
+		"multienv.postgres.dbname":   "myapp",
+		"com.docker.compose.project": "myapp",
+		"multienv.proxy":             "ignored", // bare prefix has no key
+		"unrelated":                  "x",
+	}
+	got := ForAccessory(in, "proxy")
+	want := map[string]string{
+		"domain": "app.example.com",
+		"port":   "3000",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ForAccessory proxy = %v, want %v", got, want)
+	}
+
+	if got := ForAccessory(in, "absent"); got != nil {
+		t.Errorf("ForAccessory absent = %v, want nil", got)
+	}
+}
+
 func TestAccessories(t *testing.T) {
 	t.Parallel()
 	cases := map[string]struct {
