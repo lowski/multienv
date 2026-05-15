@@ -1,0 +1,13 @@
+.lh/
+.history/
+.DS_Store
+*.log
+
+.vscode/
+
+.env*
+*.pem
+
+/multienv
+/bin/
+.claude
