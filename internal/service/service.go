@@ -10,6 +10,9 @@ import (
 // Service is a container that opts in to multienv by carrying at least
 // one label under the multienv prefix.
 type Service struct {
+	// ContainerID is the underlying Docker container ID.
+	ContainerID string
+
 	// Project is the Docker Compose project the container belongs to,
 	// or empty if the container is not part of a compose project.
 	Project string
@@ -36,6 +39,7 @@ func FromContainer(c docker.Container) (Service, bool) {
 		return Service{}, false
 	}
 	return Service{
+		ContainerID: c.ID,
 		Project:     c.Labels[labels.ComposeProject],
 		Name:        serviceName(c),
 		State:       c.State,

@@ -12,5 +12,6 @@ func NewRoot() *cobra.Command {
 		SilenceErrors: false,
 	}
 	root.AddCommand(newServicesCmd())
+	root.AddCommand(newReconcileCmd())
 	return root
 }
