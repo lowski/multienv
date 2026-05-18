@@ -7,6 +7,7 @@ import (
 	"github.com/lowski/multienv/internal/accessory"
 	"github.com/lowski/multienv/internal/accessory/postgres"
 	"github.com/lowski/multienv/internal/accessory/proxy"
+	"github.com/lowski/multienv/internal/accessory/s3"
 )
 
 // NewRoot returns the root multienv command with all subcommands attached.
@@ -31,5 +32,6 @@ func buildRegistry() *accessory.Registry {
 	reg := accessory.NewRegistry()
 	reg.Register(proxy.New())
 	reg.Register(postgres.New())
+	reg.Register(s3.New())
 	return reg
 }

@@ -108,6 +108,26 @@ func TestBuildRoutes_SkipsBadServicesAndReportsThem(t *testing.T) {
 	}
 }
 
+func TestBuildRoutes_CommaSeparatedDomainsFanOut(t *testing.T) {
+	t.Parallel()
+	in := []accessory.ServiceRequest{
+		req("s3", map[string]string{"domain": "a.example.com, b.example.com", "port": "9000"}, 9000),
+	}
+	routes, errs := buildRoutes(in)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(routes) != 2 {
+		t.Fatalf("got %d routes, want 2", len(routes))
+	}
+	if routes[0].Domain != "a.example.com" || routes[1].Domain != "b.example.com" {
+		t.Errorf("routes not as expected: %+v", routes)
+	}
+	if routes[0].Upstream != "s3:9000" || routes[1].Upstream != "s3:9000" {
+		t.Errorf("both routes should share the upstream s3:9000, got %+v", routes)
+	}
+}
+
 func TestGenerateCaddyfile_Shape(t *testing.T) {
 	t.Parallel()
 	got := generateCaddyfile([]route{

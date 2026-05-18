@@ -43,8 +43,9 @@ func (Accessory) Name() string { return "proxy" }
 func (Accessory) ConfigSchema() map[string]accessory.ConfigOption {
 	return map[string]accessory.ConfigOption{
 		"domain": {
-			Description: "The public-facing hostname the proxy should serve, e.g. app.example.com.",
-			Required:    true,
+			Description: "The public-facing hostname the proxy should serve, e.g. app.example.com. " +
+				"Accepts a comma-separated list to route multiple domains to the same upstream.",
+			Required: true,
 		},
 		"port": {
 			Description: "Target port on the service container.",
@@ -135,8 +136,8 @@ func buildRoutes(reqs []accessory.ServiceRequest) ([]route, map[string]error) {
 	var routes []route
 	for _, r := range reqs {
 		name := displayName(r.Service)
-		domain := strings.TrimSpace(r.Config["domain"])
-		if domain == "" {
+		domains := splitDomains(r.Config["domain"])
+		if len(domains) == 0 {
 			errs[name] = errors.New("missing multienv.proxy.domain")
 			continue
 		}
@@ -149,13 +150,29 @@ func buildRoutes(reqs []accessory.ServiceRequest) ([]route, map[string]error) {
 			errs[name] = err
 			continue
 		}
-		routes = append(routes, route{
-			Domain:   domain,
-			Upstream: fmt.Sprintf("%s:%d", r.Service.ContainerName, port),
-		})
+		upstream := fmt.Sprintf("%s:%d", r.Service.ContainerName, port)
+		for _, d := range domains {
+			routes = append(routes, route{Domain: d, Upstream: upstream})
+		}
 	}
 	sort.Slice(routes, func(i, j int) bool { return routes[i].Domain < routes[j].Domain })
 	return routes, errs
+}
+
+// splitDomains parses the multienv.proxy.domain label, which may be a
+// single domain or a comma-separated list. Whitespace is trimmed and
+// empty entries are dropped.
+func splitDomains(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for p := range strings.SplitSeq(raw, ",") {
+		if d := strings.TrimSpace(p); d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // ensureContainer returns the running proxy container's ID, creating

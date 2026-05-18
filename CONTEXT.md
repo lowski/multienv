@@ -41,6 +41,7 @@ internal/
     accessory.go                   # Accessory interface, Env, Registry, ConfigOption, Column, HostBindingSpec, DockerAPI
     proxy/                         # Caddy-based HTTPS proxy
     postgres/                      # PostgreSQL 18 accessory
+    s3/                            # MinIO-based S3 accessory
   state/state.go                   # ~/.multienv/state.json reader/writer
 ```
 
@@ -60,7 +61,8 @@ internal/
 - Root prefix: `multienv.`
 - Per-accessory namespace: `multienv.<accessory>.<key>=<value>`
 - A container is recognized as a multienv service iff it has at least one `multienv.*` label (see `labels.HasMultienv`).
-- The accessory's `<key>` segment is what each accessory consumes — proxy reads `domain` and `port`; postgres reads `dbname`.
+- The accessory's `<key>` segment is what each accessory consumes — proxy reads `domain` and `port`; postgres reads `dbname`; s3 reads `bucket`, `domain`, and `public`.
+- **Cross-accessory plumbing via labels.** Accessories never call into each other in Go. When the s3 accessory needs proxy routing for its container, it stamps `multienv.proxy.domain` / `multienv.proxy.port` onto the `multienv-s3` container itself; the proxy then picks it up as just another service. This is the prescribed pattern for any future accessory that needs HTTP fronting.
 - `multienv.managed=true` is set on multienv-owned resources (the network, the proxy container, the postgres container).
 - Standard compose labels are also read: `com.docker.compose.project`, `com.docker.compose.service`.
 
@@ -211,6 +213,7 @@ Schema (current `state.CurrentVersion` is `1`):
 - Caddyfile contains `{ local_certs }` so all sites use Caddy's internal CA. HTTP→HTTPS redirect stays on (Caddy default).
 - Port resolution: `multienv.proxy.port` label, then first container-exposed port (sorted ascending), then per-service skip with an error.
 - Upstream target: `<containerName>:<port>` — the container's primary name on the multienv network.
+- **Comma-separated `multienv.proxy.domain`** is supported: a single container can serve multiple domains all pointing to the same upstream. `buildRoutes` fans each comma-separated value out to its own `route` entry; downstream Caddyfile generation is unchanged. The s3 accessory relies on this to register every requested s3 domain on one shared `multienv-s3` container.
 - `HostBinding() returns nil` — 80/443 are not user-configurable; the `publish` command is intentionally absent from the proxy.
 - Per-accessory command: `multienv proxy trust-ca` (extracts CA via `docker cp` to `/tmp/multienv-caddy-ca.crt`, prints OS-appropriate trust instructions, does **not** sudo on its own).
 
@@ -225,6 +228,24 @@ Schema (current `state.CurrentVersion` is `1`):
   - in-network: `postgres://postgres:postgres@multienv-postgres:5432/<db>`
   - from host: `postgres://postgres:postgres@127.0.0.1:<host_port>/<db>`
 - `HostBinding() returns {Description: "PostgreSQL", DefaultPort: 5432}` → the `publish` subcommand is enabled.
+
+### s3 (`internal/accessory/s3/`)
+
+- Container: `multienv-s3` running `minio/minio:latest`, cmd `server /data --console-address :9001`, named volume `multienv-s3-data` → `/data`, default published on `127.0.0.1:9000`. Credentials are blanket `minioadmin:minioadmin`. The console port (9001) stays in-network only — `HostBinding` covers the S3 API port (9000) only.
+- Labels read on service containers:
+  - `multienv.s3.bucket=<name>` (required) — strict regex `^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$` (S3 naming subset, no dots/underscores/uppercase).
+  - `multienv.s3.domain=<host>` (optional) — when present, the accessory stamps a corresponding `multienv.proxy.domain` label onto the `multienv-s3` container so the proxy serves that hostname over HTTPS.
+  - `multienv.s3.public=<bool>` (optional, default false) — toggles anonymous read on the bucket via `mc anonymous set download|none local/<bucket>`. Parsed with `strconv.ParseBool`.
+- **`mc` is exec'd directly inside the MinIO container** (the official image ships with mc since 2022). Container env includes `MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000`, so exec commands don't need a shell wrapper or per-call `mc alias set`.
+- Readiness: poll `mc ready local` every 1s up to 30s.
+- Idempotent bucket creation: `mc stat local/<name>` (exit code distinguishes exists vs missing); only `mc mb` when missing.
+- Anonymous-read policy: applied unconditionally via `mc anonymous set <download|none>` after `ensureBucket` (mc handles idempotency). No read-modify-write.
+- **Container drift triggers recreation.** `matchesDesired(c, hostPort, domains)` checks both the host-port binding and the current `multienv.proxy.domain` label; either mismatch forces a `ContainerRemove(force=true)` and a fresh create. Volume preserves data. `logRecreateReason` emits one log line per piece of drift before the recreate. Triggered end-to-end by `multienv s3 publish ...` and by any change to the set of services declaring `multienv.s3.domain`.
+- Per-bucket conflict handling: if two services request the same bucket name with different `public` values, the first requester wins and the conflict is logged as a per-service error (does not fail the reconcile).
+- `HostBinding() returns {Description: "S3 (MinIO)", DefaultPort: 9000}` → `publish` enabled.
+- Connection convention:
+  - in-network: `http://minioadmin:minioadmin@multienv-s3:9000`
+  - from host: `http://minioadmin:minioadmin@127.0.0.1:<host_port>`
 
 ## Development conventions
 
@@ -265,6 +286,7 @@ Per the project's `feedback_scope_discipline` memory: when a CLI invocation fail
 - A failed `compose up` after a label change leaves the old container in `ListContainers(All:true)` because we list stopped containers too. Reconcile happily ignores them; they just appear with `status=stopped` in `services`.
 - We never tear down accessory containers when no services request them anymore. By design (dev tool — don't surprise the user). A future `multienv <accessory> prune` is fine.
 - We do not parse `docker-compose.yaml`. All knowledge comes from container labels at the daemon.
+- Container labels are immutable after create. Any accessory that mutates labels based on per-service requests (s3 does this for proxy routing) must recreate its container to apply changes — design the matching check accordingly and rely on the named volume to preserve data.
 
 ## What is explicitly NOT in scope (today)
 
