@@ -5,6 +5,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/lowski/multienv/internal/accessory"
+	"github.com/lowski/multienv/internal/accessory/postgres"
 	"github.com/lowski/multienv/internal/accessory/proxy"
 )
 
@@ -29,5 +30,6 @@ func NewRoot() *cobra.Command {
 func buildRegistry() *accessory.Registry {
 	reg := accessory.NewRegistry()
 	reg.Register(proxy.New())
+	reg.Register(postgres.New())
 	return reg
 }

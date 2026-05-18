@@ -17,6 +17,7 @@ import (
 	"github.com/lowski/multienv/internal/docker"
 	"github.com/lowski/multienv/internal/labels"
 	"github.com/lowski/multienv/internal/service"
+	"github.com/lowski/multienv/internal/state"
 )
 
 // NetworkName is the name of the shared network every multienv service
@@ -45,6 +46,11 @@ type Reconciler struct {
 // Reconcile runs every reconciliation step. Per-step failures are
 // collected so one bad step does not block the others.
 func (r *Reconciler) Reconcile(ctx context.Context) error {
+	st, err := state.Load()
+	if err != nil {
+		r.logHousekeeping("could not read state file (using defaults): %v", err)
+	}
+
 	netID, attached, err := r.ensureNetwork(ctx)
 	if err != nil {
 		return err
@@ -59,8 +65,14 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if err := r.attachServices(ctx, netID, attached, services); err != nil {
 		errs = append(errs, err)
 	}
-	if err := r.reconcileAccessories(ctx, netID, containers, services); err != nil {
+	if err := r.reconcileAccessories(ctx, netID, containers, services, st); err != nil {
 		errs = append(errs, err)
+	}
+
+	if !r.DryRun {
+		if err := state.Save(st); err != nil {
+			r.logHousekeeping("could not persist state: %v", err)
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -120,25 +132,42 @@ func (r *Reconciler) attachServices(ctx context.Context, netID string, attached 
 	return nil
 }
 
-// reconcileAccessories drives each registered accessory: it collects
-// per-service config requests from labels and hands them off, with a
-// prefix-bound logger so accessory output flows through the
-// [accessory <name>] channel.
-func (r *Reconciler) reconcileAccessories(ctx context.Context, netID string, containers []docker.Container, services []service.Service) error {
+// reconcileAccessories drives each registered accessory and records the
+// observed service-to-accessory mapping into state.
+func (r *Reconciler) reconcileAccessories(ctx context.Context, netID string, containers []docker.Container, services []service.Service, st *state.State) error {
 	if r.Accessories == nil {
 		return nil
 	}
 	labelsByID := indexLabels(containers)
 
+	// Per-service map accumulated across all accessories so the state
+	// file ends up with one entry per service holding every accessory
+	// it was observed to use this round.
+	perService := map[string]map[string]map[string]string{}
+
 	var errs []error
 	for _, acc := range r.Accessories.All() {
 		reqs := r.collectRequests(acc.Name(), services, labelsByID)
-		env := r.accessoryEnv(acc.Name(), netID)
+
+		for _, req := range reqs {
+			key := displayName(req.Service)
+			if perService[key] == nil {
+				perService[key] = map[string]map[string]string{}
+			}
+			perService[key][acc.Name()] = req.Config
+		}
+
+		env := r.accessoryEnv(acc, netID, st)
 		if err := acc.Reconcile(ctx, env, reqs); err != nil {
 			r.logAccessory(acc.Name(), "FAILED: %v", err)
 			errs = append(errs, fmt.Errorf("%s: %w", acc.Name(), err))
 		}
 	}
+
+	for key, cfgs := range perService {
+		st.RecordService(key, cfgs)
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("reconcile accessories: %w", errors.Join(errs...))
 	}
@@ -157,12 +186,23 @@ func (r *Reconciler) collectRequests(name string, services []service.Service, la
 	return out
 }
 
-func (r *Reconciler) accessoryEnv(name, netID string) accessory.Env {
+// accessoryEnv builds the per-accessory execution context, resolving
+// the host-bound port from state (or the accessory's default).
+func (r *Reconciler) accessoryEnv(acc accessory.Accessory, netID string, st *state.State) accessory.Env {
+	var hostPort uint16
+	if hb := acc.HostBinding(); hb != nil {
+		hostPort = hb.DefaultPort
+		if v, ok := st.AccessoryHostPort(acc.Name()); ok {
+			hostPort = v
+		}
+	}
+	name := acc.Name()
 	return accessory.Env{
-		Docker:    r.Docker,
-		NetworkID: netID,
-		Network:   NetworkName,
-		DryRun:    r.DryRun,
+		Docker:        r.Docker,
+		NetworkID:     netID,
+		Network:       NetworkName,
+		DryRun:        r.DryRun,
+		HostBoundPort: hostPort,
 		Log: func(format string, args ...any) {
 			r.logAccessory(name, format, args...)
 		},

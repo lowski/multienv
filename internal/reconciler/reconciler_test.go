@@ -5,12 +5,27 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/lowski/multienv/internal/accessory"
 	"github.com/lowski/multienv/internal/docker"
+	"github.com/lowski/multienv/internal/state"
 )
+
+// TestMain isolates state-file I/O across the whole package test run
+// so the reconciler never touches the real ~/.multienv during testing.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "multienv-reconciler-test-*")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	os.Setenv(state.PathEnv, filepath.Join(dir, "state.json"))
+	os.Exit(m.Run())
+}
 
 // fakeDocker is a controllable in-memory stand-in for docker.Client.
 type fakeDocker struct {
@@ -32,7 +47,8 @@ func (*fakeDocker) ContainerInspect(context.Context, string) (*docker.Container,
 func (*fakeDocker) ContainerCreate(context.Context, docker.ContainerSpec) (string, error) {
 	return "", nil
 }
-func (*fakeDocker) ContainerStart(context.Context, string) error { return nil }
+func (*fakeDocker) ContainerStart(context.Context, string) error           { return nil }
+func (*fakeDocker) ContainerRemove(context.Context, string, bool) error    { return nil }
 func (*fakeDocker) ContainerExec(context.Context, string, []string, io.Reader, io.Writer) error {
 	return nil
 }
@@ -200,6 +216,10 @@ type fakeAccessory struct {
 func (f *fakeAccessory) Name() string                                    { return f.name }
 func (f *fakeAccessory) ConfigSchema() map[string]accessory.ConfigOption { return nil }
 func (f *fakeAccessory) Commands() []accessory.Command                   { return nil }
+func (f *fakeAccessory) HostBinding() *accessory.HostBindingSpec         { return nil }
+func (f *fakeAccessory) ServicesColumns(accessory.ServiceRequest) []accessory.Column {
+	return nil
+}
 func (f *fakeAccessory) Reconcile(_ context.Context, env accessory.Env, reqs []accessory.ServiceRequest) error {
 	f.gotRequests = reqs
 	env.Log("saw %d request(s)", len(reqs))

@@ -11,20 +11,43 @@ import (
 	"github.com/lowski/multienv/internal/docker"
 )
 
+// reservedAccessoryCommands are subcommand names provided by the
+// framework. An accessory cannot define commands with these names.
+var reservedAccessoryCommands = map[string]bool{
+	"services": true,
+	"publish":  true,
+}
+
 // addAccessoryCommands registers one top-level command per accessory.
-// The parent command's help text is rendered from ConfigSchema(); each
-// accessory.Command is wrapped into a cobra.Command so accessories
-// never import cobra themselves.
+// The framework attaches `services` to every accessory and `publish`
+// to those that declare a HostBinding; each accessory contributes its
+// own Commands() for accessory-specific actions.
 func addAccessoryCommands(root *cobra.Command, reg *accessory.Registry) {
 	for _, acc := range reg.All() {
+		ownCommands := acc.Commands()
+		for _, c := range ownCommands {
+			if reservedAccessoryCommands[c.Name] {
+				panic(fmt.Sprintf(
+					"accessory %q tried to register reserved command %q; reserved names are provided by the framework",
+					acc.Name(), c.Name,
+				))
+			}
+		}
+
 		parent := &cobra.Command{
 			Use:   acc.Name(),
 			Short: fmt.Sprintf("Manage the %s accessory", acc.Name()),
 			Long:  renderAccessoryHelp(acc),
 		}
-		for _, sub := range acc.Commands() {
+
+		parent.AddCommand(newServicesSubcommand(acc))
+		if acc.HostBinding() != nil {
+			parent.AddCommand(newPublishSubcommand(acc, reg))
+		}
+		for _, sub := range ownCommands {
 			parent.AddCommand(toCobra(acc, sub))
 		}
+
 		root.AddCommand(parent)
 	}
 }

@@ -54,6 +54,19 @@ func (Accessory) ConfigSchema() map[string]accessory.ConfigOption {
 	}
 }
 
+// HostBinding returns nil — the proxy's host bindings (80 and 443) are
+// not user-configurable: they are the whole point of running the proxy.
+func (Accessory) HostBinding() *accessory.HostBindingSpec { return nil }
+
+// ServicesColumns renders the proxy's per-service columns for the
+// framework `services` listing.
+func (Accessory) ServicesColumns(r accessory.ServiceRequest) []accessory.Column {
+	return []accessory.Column{
+		{Header: "DOMAIN", Value: r.Config["domain"]},
+		{Header: "PORT", Value: r.Config["port"]},
+	}
+}
+
 func (a Accessory) Commands() []accessory.Command {
 	return []accessory.Command{
 		{

@@ -26,6 +26,31 @@ type Accessory interface {
 	ConfigSchema() map[string]ConfigOption
 	Commands() []Command
 	Reconcile(ctx context.Context, env Env, requests []ServiceRequest) error
+
+	// HostBinding describes the accessory's host-port binding, or nil if
+	// the accessory does not expose a configurable host port. Returning
+	// non-nil enables the framework-provided `publish` subcommand.
+	HostBinding() *HostBindingSpec
+
+	// ServicesColumns returns the per-service columns rendered by the
+	// framework-provided `services` subcommand, after the common
+	// PROJECT/SERVICE columns. Each accessory pulls the values from the
+	// request's labels.
+	ServicesColumns(req ServiceRequest) []Column
+}
+
+// HostBindingSpec declares an accessory's host-port binding shape. The
+// state file is consulted for the actual port at runtime; this struct
+// only provides the default and human description for help output.
+type HostBindingSpec struct {
+	Description string // shown in `publish` help, e.g. "PostgreSQL"
+	DefaultPort uint16 // initial port when nothing recorded in state
+}
+
+// Column is one cell in a `services` table row.
+type Column struct {
+	Header string
+	Value  string
 }
 
 // ConfigOption documents one label-driven configuration option.
@@ -64,6 +89,7 @@ type DockerAPI interface {
 	ContainerInspect(ctx context.Context, nameOrID string) (*docker.Container, error)
 	ContainerCreate(ctx context.Context, spec docker.ContainerSpec) (string, error)
 	ContainerStart(ctx context.Context, id string) error
+	ContainerRemove(ctx context.Context, id string, force bool) error
 	ContainerExec(ctx context.Context, id string, cmd []string, stdin io.Reader, stdout io.Writer) error
 	ContainerCopyFrom(ctx context.Context, id, srcPath string, dst io.Writer) error
 	ImagePull(ctx context.Context, ref string) error
@@ -79,6 +105,11 @@ type Env struct {
 	Network   string // name of the shared multienv network
 	Log       func(format string, args ...any)
 	DryRun    bool
+	// HostBoundPort is the resolved host port the accessory should
+	// publish on, or 0 if the host binding is disabled / not applicable.
+	// The reconciler computes this from the state file, falling back to
+	// the accessory's HostBindingSpec.DefaultPort.
+	HostBoundPort uint16
 }
 
 // Registry collects accessory implementations for the CLI and reconciler.

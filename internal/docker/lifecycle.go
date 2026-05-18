@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/netip"
 	"path"
+	"strconv"
 
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
@@ -39,15 +40,56 @@ func (c *Client) ContainerInspect(ctx context.Context, nameOrID string) (*Contai
 	if r.State != nil {
 		out.State = string(r.State.Status)
 	}
-	if r.Config != nil {
-		for p := range r.Config.ExposedPorts {
-			out.Ports = append(out.Ports, ContainerPort{
-				Private:  p.Num(),
-				Protocol: string(p.Proto()),
-			})
+	out.Ports = readInspectPorts(r)
+	return out, nil
+}
+
+// readInspectPorts merges image-exposed ports with the live host-port
+// publications recorded in NetworkSettings.Ports. ExposedPorts alone
+// only tells you which container ports an image declares; the
+// publication-to-host mapping lives in NetworkSettings.
+func readInspectPorts(r container.InspectResponse) []ContainerPort {
+	published := map[network.Port]uint16{}
+	if r.NetworkSettings != nil {
+		for port, bindings := range r.NetworkSettings.Ports {
+			for _, b := range bindings {
+				if b.HostPort == "" {
+					continue
+				}
+				n, err := strconv.ParseUint(b.HostPort, 10, 16)
+				if err != nil {
+					continue
+				}
+				published[port] = uint16(n)
+				break
+			}
 		}
 	}
-	return out, nil
+
+	seen := map[network.Port]bool{}
+	var out []ContainerPort
+	add := func(p network.Port) {
+		if seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, ContainerPort{
+			Private:  p.Num(),
+			Public:   published[p],
+			Protocol: string(p.Proto()),
+		})
+	}
+	if r.Config != nil {
+		for p := range r.Config.ExposedPorts {
+			add(p)
+		}
+	}
+	if r.NetworkSettings != nil {
+		for p := range r.NetworkSettings.Ports {
+			add(p)
+		}
+	}
+	return out
 }
 
 // ContainerCreate creates a container from the given spec and returns
@@ -119,6 +161,16 @@ func (c *Client) ContainerCreate(ctx context.Context, spec ContainerSpec) (strin
 func (c *Client) ContainerStart(ctx context.Context, id string) error {
 	if _, err := c.api.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("start container %s: %w", id, err)
+	}
+	return nil
+}
+
+// ContainerRemove deletes a container. When force is true the
+// container is killed first if running. Named volumes attached to the
+// container are not removed (only the container itself).
+func (c *Client) ContainerRemove(ctx context.Context, id string, force bool) error {
+	if _, err := c.api.ContainerRemove(ctx, id, client.ContainerRemoveOptions{Force: force}); err != nil {
+		return fmt.Errorf("remove container %s: %w", id, err)
 	}
 	return nil
 }
