@@ -15,7 +15,7 @@ The binary's purpose is to converge the local Docker state toward what the union
 2. Attaches every multienv-labeled service container to that network.
 3. For each registered accessory, hands the matching service requests to that accessory, which then owns its own container's lifecycle and config push.
 
-A future daemon mode (event-driven reconciliation) is anticipated but not yet implemented; the reconciler is intentionally written to be one-shot today and reusable in a daemon later.
+The reconciler is one-shot and idempotent. `multienv daemon` drives it from Docker events: an initial reconcile on startup, then a debounced reconcile whenever a container or network change could affect the multienv environment.
 
 ## Repository layout
 
@@ -28,15 +28,18 @@ internal/
     services_cmd.go                # framework: <accessory> services subcommand
     publish_cmd.go                 # framework: <accessory> publish subcommand
     reconcile.go                   # top-level reconcile command
+    daemon.go                      # top-level `multienv daemon` command
     services.go                    # top-level `multienv services list`
   docker/                          # the only package that imports the Docker SDK
     client.go                      # Client wrapper, ListContainers
     container.go                   # Container / ContainerPort / ContainerSpec / Mount / PortBinding
     network.go                     # NetworkInspect/Create/Connect, Network type, ErrNotFound
     lifecycle.go                   # ContainerInspect/Create/Start/Remove/Exec/CopyFrom + ImagePull + demuxDockerStream
+    events.go                      # Events(ctx) — daemon-agnostic Event projection
   labels/labels.go                 # multienv.* prefix, HasMultienv, ForAccessory, Accessories
   service/service.go               # Service domain type + FromContainer(s)
   reconciler/reconciler.go         # Reconciler with three phases + three log channels
+  daemon/daemon.go                 # event-driven, debounced reconcile loop
   accessory/
     accessory.go                   # Accessory interface, Env, Registry, ConfigOption, Column, HostBindingSpec, DockerAPI
     proxy/                         # Caddy-based HTTPS proxy
@@ -276,6 +279,18 @@ go build -o ./multienv ./cmd/multienv   # produce the binary (gitignored at repo
 
 The repo's `.gitignore` already excludes `/multienv` and `/bin/`.
 
+### Docker packaging
+
+The `Dockerfile` at the repo root produces a ~7MB scratch-based image whose default command is `daemon`. Build with `docker build -t multienv .`. The container expects:
+
+- `/var/run/docker.sock` bind-mounted in (the daemon controls the host's Docker).
+- A volume mounted at `/data`; the image sets `MULTIENV_STATE_FILE=/data/state.json` so state survives recreates.
+- `NO_COLOR=1` is recommended when logs go to `journalctl`/`docker logs`.
+
+Cross-arch images are buildable via `docker buildx build --platform linux/amd64,linux/arm64 .`.
+
+The image deliberately has no shell or CA bundle: multienv talks to Docker over the unix socket; image pulls happen on the host daemon, not from inside the container.
+
 ### When the user's environment causes a failure
 
 Per the project's `feedback_scope_discipline` memory: when a CLI invocation fails for an obvious environmental reason (missing Docker socket, missing env var, daemon down, missing credential), **state the cause and stop**. Do not probe the user's machine (`docker context ls`, `ls /var/run/...`, etc.) or pre-emptively expand the code with fallbacks unless explicitly asked.
@@ -290,7 +305,7 @@ Per the project's `feedback_scope_discipline` memory: when a CLI invocation fail
 
 ## What is explicitly NOT in scope (today)
 
-- Daemon mode / Docker event subscription (reconciler is structured to allow it; just not implemented).
+- Backgrounding the daemon (no launchd / systemd integration, no PID file, no single-instance lock). `multienv daemon` runs in the foreground; users background it themselves.
 - Injecting env vars into running service containers (impossible without recreate; we chose the by-convention approach: services hardcode connection URLs from documented patterns).
 - Auto-trusting CAs / running sudo on the user's behalf in `trust-ca`.
 - Per-service postgres users/passwords (everything uses the `postgres` superuser; isolation is zero — dev only).
@@ -304,6 +319,7 @@ Per the project's `feedback_scope_discipline` memory: when a CLI invocation fail
 | Command | Behavior |
 |---|---|
 | `multienv reconcile [--dry-run]` | Full pass: network + attach + accessories + state write |
+| `multienv daemon [--debounce DUR]` | Initial reconcile + watch Docker events; debounced reconcile on container/network changes. Ctrl-C to stop. |
 | `multienv services list` | All current multienv services (top-level — not the accessory subcommand) |
 | `multienv <accessory>` | Help with config schema |
 | `multienv <accessory> services` | Services using this accessory (history+state if file present, live otherwise) |
@@ -312,7 +328,8 @@ Per the project's `feedback_scope_discipline` memory: when a CLI invocation fail
 
 | File / Env | Purpose |
 |---|---|
-| `~/.multienv/state.json` | multienv's own mutable state |
-| `MULTIENV_STATE_FILE` | Override state-file path (used by tests) |
+| `~/.multienv/state.json` | multienv's own mutable state (in-image: `/data/state.json`) |
+| `MULTIENV_STATE_FILE` | Override state-file path (used by tests; set by the Docker image to `/data/state.json`) |
 | `NO_COLOR` | Disable ANSI color in log channels |
 | `DOCKER_HOST` etc. | Honored via `client.FromEnv` |
+| `Dockerfile` | Containerized daemon — bind `/var/run/docker.sock`, mount a volume at `/data` |

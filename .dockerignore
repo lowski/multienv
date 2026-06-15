@@ -1,0 +1,10 @@
+.git
+.gitignore
+.dockerignore
+Dockerfile
+compose.yml
+README.md
+CONTEXT.md
+/multienv
+/bin/
+**/*_test.go

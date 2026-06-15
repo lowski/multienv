@@ -22,6 +22,7 @@ func NewRoot() *cobra.Command {
 	}
 	root.AddCommand(newServicesCmd())
 	root.AddCommand(newReconcileCmd(reg))
+	root.AddCommand(newDaemonCmd(reg))
 	addAccessoryCommands(root, reg)
 	return root
 }
