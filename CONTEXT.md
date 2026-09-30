@@ -44,7 +44,7 @@ internal/
     accessory.go                   # Accessory interface, Env, Registry, ConfigOption, Column, HostBindingSpec, DockerAPI
     proxy/                         # Caddy-based HTTPS proxy
     postgres/                      # PostgreSQL 18 accessory
-    s3/                            # MinIO-based S3 accessory
+    s3/                            # RustFS-based S3 accessory
   state/state.go                   # ~/.multienv/state.json reader/writer
 ```
 
@@ -234,21 +234,21 @@ Schema (current `state.CurrentVersion` is `1`):
 
 ### s3 (`internal/accessory/s3/`)
 
-- Container: `multienv-s3` running `minio/minio:latest`, cmd `server /data --console-address :9001`, named volume `multienv-s3-data` → `/data`, default published on `127.0.0.1:9000`. Credentials are blanket `minioadmin:minioadmin`. The console port (9001) stays in-network only — `HostBinding` covers the S3 API port (9000) only.
+- Container: `multienv-s3` running `rustfs/rustfs:latest` with the image's default entrypoint/cmd, named volume `multienv-s3-rustfs-data` → `/data`, default published on `127.0.0.1:9000`. Configured purely via env (`RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `RUSTFS_VOLUMES`, `RUSTFS_ADDRESS`, `RUSTFS_CONSOLE_ENABLE`, `RUSTFS_CONSOLE_ADDRESS`). Credentials are blanket `rustfsadmin:rustfsadmin` (the entrypoint logs a default-credential warning; expected). The console port (9001) stays in-network only — `HostBinding` covers the S3 API port (9000) only.
 - Labels read on service containers:
   - `multienv.s3.bucket=<name>` (required) — strict regex `^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$` (S3 naming subset, no dots/underscores/uppercase).
   - `multienv.s3.domain=<host>` (optional) — when present, the accessory stamps a corresponding `multienv.proxy.domain` label onto the `multienv-s3` container so the proxy serves that hostname over HTTPS.
-  - `multienv.s3.public=<bool>` (optional, default false) — toggles anonymous read on the bucket via `mc anonymous set download|none local/<bucket>`. Parsed with `strconv.ParseBool`.
-- **`mc` is exec'd directly inside the MinIO container** (the official image ships with mc since 2022). Container env includes `MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000`, so exec commands don't need a shell wrapper or per-call `mc alias set`.
-- Readiness: poll `mc ready local` every 1s up to 30s.
-- Idempotent bucket creation: `mc stat local/<name>` (exit code distinguishes exists vs missing); only `mc mb` when missing.
-- Anonymous-read policy: applied unconditionally via `mc anonymous set <download|none>` after `ensureBucket` (mc handles idempotency). No read-modify-write.
-- **Container drift triggers recreation.** `matchesDesired(c, hostPort, domains)` checks both the host-port binding and the current `multienv.proxy.domain` label; either mismatch forces a `ContainerRemove(force=true)` and a fresh create. Volume preserves data. `logRecreateReason` emits one log line per piece of drift before the recreate. Triggered end-to-end by `multienv s3 publish ...` and by any change to the set of services declaring `multienv.s3.domain`.
+  - `multienv.s3.public=<bool>` (optional, default false) — toggles anonymous read on the bucket (object GET only, no listing). Parsed with `strconv.ParseBool`.
+- **Bucket management is SigV4-signed `curl` exec'd inside the RustFS container.** The image ships no S3 CLI (no `mc`), but its curl supports `--aws-sigv4`. `s3Request` builds the argv; `-f` makes HTTP errors a non-zero exit so `ContainerExec` returns an error. No shell wrapper.
+- Readiness: poll `curl -f http://127.0.0.1:9000/health` every 1s up to 30s.
+- Idempotent bucket creation: `HEAD /<name>` (exit code distinguishes exists vs missing); only `PUT /<name>` when missing.
+- Anonymous-read policy: applied unconditionally after `ensureBucket` — `PUT /<name>?policy` with a `s3:GetObject` (+ `s3:GetBucketLocation`) policy for public, `DELETE /<name>?policy` for private. Both are idempotent. No read-modify-write.
+- **Container drift triggers recreation.** `matchesDesired(c, hostPort, domains)` checks the image reference, the host-port binding, and the current `multienv.proxy.domain` label; any mismatch forces a `ContainerRemove(force=true)` and a fresh create. Volume preserves data. `logRecreateReason` emits one log line per piece of drift before the recreate. Triggered end-to-end by `multienv s3 publish ...` and by any change to the set of services declaring `multienv.s3.domain`.
 - Per-bucket conflict handling: if two services request the same bucket name with different `public` values, the first requester wins and the conflict is logged as a per-service error (does not fail the reconcile).
-- `HostBinding() returns {Description: "S3 (MinIO)", DefaultPort: 9000}` → `publish` enabled.
+- `HostBinding() returns {Description: "S3 (RustFS)", DefaultPort: 9000}` → `publish` enabled.
 - Connection convention:
-  - in-network: `http://minioadmin:minioadmin@multienv-s3:9000`
-  - from host: `http://minioadmin:minioadmin@127.0.0.1:<host_port>`
+  - in-network: `http://rustfsadmin:rustfsadmin@multienv-s3:9000`
+  - from host: `http://rustfsadmin:rustfsadmin@127.0.0.1:<host_port>`
 
 ## Development conventions
 

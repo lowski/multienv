@@ -29,9 +29,12 @@ func (c *Client) ContainerInspect(ctx context.Context, nameOrID string) (*Contai
 		return nil, fmt.Errorf("inspect container %q: %w", nameOrID, err)
 	}
 	r := res.Container
+	// Config.Image is the reference the container was created from (e.g.
+	// "rustfs/rustfs:latest"), matching what ListContainers reports;
+	// r.Image is the resolved image ID.
 	out := &Container{
 		ID:     r.ID,
-		Image:  r.Image,
+		Image:  r.Config.Image,
 		Labels: r.Config.Labels,
 	}
 	if r.Name != "" {

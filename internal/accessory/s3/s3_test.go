@@ -3,6 +3,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -208,14 +209,14 @@ func TestCollectBuckets_InvalidPublicValueRejected(t *testing.T) {
 	}
 }
 
-func TestSetBucketPolicy_MapsBoolToMcPermission(t *testing.T) {
+func TestSetBucketPolicy_MapsBoolToPolicyRequest(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		public bool
 		want   string
 	}{
-		{true, "anonymous:set:download:local/uploads"},
-		{false, "anonymous:set:none:local/uploads"},
+		{true, "PUT /uploads?policy="},
+		{false, "DELETE /uploads?policy="},
 	}
 	for _, c := range cases {
 		fd := &fakeDocker{}
@@ -226,6 +227,41 @@ func TestSetBucketPolicy_MapsBoolToMcPermission(t *testing.T) {
 		if len(fd.calls) != 1 || fd.calls[0] != c.want {
 			t.Errorf("public=%v: calls = %v, want [%s]", c.public, fd.calls, c.want)
 		}
+	}
+}
+
+func TestSetBucketPolicy_PublicAllowsAnonymousGetObjectOnly(t *testing.T) {
+	t.Parallel()
+	fd := &fakeDocker{}
+	env := accessory.Env{Docker: fd, Log: func(string, ...any) {}}
+	if err := setBucketPolicy(context.Background(), env, "id", "uploads", true); err != nil {
+		t.Fatalf("setBucketPolicy: %v", err)
+	}
+	var policy struct {
+		Statement []struct {
+			Effect    string
+			Principal map[string][]string
+			Action    []string
+			Resource  []string
+		}
+	}
+	if err := json.Unmarshal([]byte(fd.lastBody), &policy); err != nil {
+		t.Fatalf("policy body is not JSON: %v (%q)", err, fd.lastBody)
+	}
+	granted := map[string]string{}
+	for _, st := range policy.Statement {
+		if st.Effect != "Allow" || len(st.Principal["AWS"]) != 1 || st.Principal["AWS"][0] != "*" {
+			t.Errorf("unexpected statement %+v", st)
+		}
+		for _, a := range st.Action {
+			granted[a] = strings.Join(st.Resource, ",")
+		}
+	}
+	if granted["s3:GetObject"] != "arn:aws:s3:::uploads/*" {
+		t.Errorf("s3:GetObject resource = %q, want arn:aws:s3:::uploads/*", granted["s3:GetObject"])
+	}
+	if _, listable := granted["s3:ListBucket"]; listable {
+		t.Error("public bucket must not be anonymously listable")
 	}
 }
 
@@ -283,9 +319,10 @@ func TestCollectDomains_RejectsInvalid(t *testing.T) {
 type fakeDocker struct {
 	current *docker.Container // returned by ContainerInspect (nil = NotFound)
 
-	calls       []string // ordered: "inspect:<name>" / "remove:<id>" / "pull" / "create:<name>" / "start:<id>" / "ready" / "exec"
-	existingMcs map[string]bool
-	lastSpec    *docker.ContainerSpec
+	calls    []string        // ordered: "inspect:<name>" / "remove:<id>" / "pull" / "create:<name>" / "start:<id>" / "<METHOD> <path>"
+	buckets  map[string]bool // bucket paths ("/uploads") that exist
+	lastBody string          // --data-binary of the most recent S3 request
+	lastSpec *docker.ContainerSpec
 }
 
 func (f *fakeDocker) ListContainers(context.Context) ([]docker.Container, error) {
@@ -314,6 +351,7 @@ func (f *fakeDocker) ContainerCreate(_ context.Context, spec docker.ContainerSpe
 	f.current = &docker.Container{
 		ID:     id,
 		Names:  []string{"/" + spec.Name},
+		Image:  spec.Image,
 		State:  "created",
 		Labels: spec.Labels,
 	}
@@ -334,31 +372,40 @@ func (f *fakeDocker) ContainerRemove(_ context.Context, id string, _ bool) error
 	return nil
 }
 
+// ContainerExec interprets the curl invocations the accessory issues,
+// recording each as "<METHOD> <path>" relative to the local S3 API.
 func (f *fakeDocker) ContainerExec(_ context.Context, _ string, cmd []string, _ io.Reader, _ io.Writer) error {
-	if len(cmd) >= 2 && cmd[0] == "mc" && cmd[1] == "ready" {
-		f.calls = append(f.calls, "ready")
+	if len(cmd) == 0 || cmd[0] != "curl" {
+		f.calls = append(f.calls, "exec")
 		return nil
 	}
-	if len(cmd) >= 3 && cmd[0] == "mc" && cmd[1] == "stat" {
-		f.calls = append(f.calls, "stat:"+cmd[2])
-		if f.existingMcs[cmd[2]] {
-			return nil
+	method := "GET"
+	for i, arg := range cmd {
+		switch arg {
+		case "-I":
+			method = "HEAD"
+		case "-X":
+			method = cmd[i+1]
+		case "--data-binary":
+			f.lastBody = cmd[i+1]
 		}
-		return errors.New("bucket not found")
 	}
-	if len(cmd) >= 3 && cmd[0] == "mc" && cmd[1] == "mb" {
-		f.calls = append(f.calls, "mb:"+cmd[2])
-		if f.existingMcs == nil {
-			f.existingMcs = map[string]bool{}
+	path := strings.TrimPrefix(cmd[len(cmd)-1], localURL(""))
+	f.calls = append(f.calls, method+" "+path)
+
+	switch method {
+	case "HEAD":
+		if !f.buckets[path] {
+			return errors.New("curl: (22) The requested URL returned error: 404")
 		}
-		f.existingMcs[cmd[2]] = true
-		return nil
+	case "PUT":
+		if !strings.Contains(path, "?") {
+			if f.buckets == nil {
+				f.buckets = map[string]bool{}
+			}
+			f.buckets[path] = true
+		}
 	}
-	if len(cmd) >= 5 && cmd[0] == "mc" && cmd[1] == "anonymous" && cmd[2] == "set" {
-		f.calls = append(f.calls, "anonymous:set:"+cmd[3]+":"+cmd[4])
-		return nil
-	}
-	f.calls = append(f.calls, "exec")
 	return nil
 }
 
@@ -377,6 +424,7 @@ func TestEnsureContainer_RecreatesOnHostPortMismatch(t *testing.T) {
 		current: &docker.Container{
 			ID:    "old-id",
 			Names: []string{"/" + ContainerName},
+			Image: Image,
 			State: "running",
 			Ports: []docker.ContainerPort{
 				{Private: internalPort, Public: 9000, Protocol: "tcp"},
@@ -422,6 +470,7 @@ func TestEnsureContainer_StartsExistingOnMatch(t *testing.T) {
 		current: &docker.Container{
 			ID:    "id1",
 			Names: []string{"/" + ContainerName},
+			Image: Image,
 			State: "exited",
 			Ports: []docker.ContainerPort{
 				{Private: internalPort, Public: 9000, Protocol: "tcp"},
@@ -497,6 +546,7 @@ func TestEnsureContainer_RecreatesOnDomainDrift(t *testing.T) {
 		current: &docker.Container{
 			ID:    "old-id",
 			Names: []string{"/" + ContainerName},
+			Image: Image,
 			State: "running",
 			Ports: []docker.ContainerPort{{Private: internalPort, Public: 9000, Protocol: "tcp"}},
 			Labels: map[string]string{
@@ -534,6 +584,46 @@ func TestEnsureContainer_RecreatesOnDomainDrift(t *testing.T) {
 	}
 }
 
+func TestEnsureContainer_ReplacesLegacyMinIOContainer(t *testing.T) {
+	t.Parallel()
+	fd := &fakeDocker{
+		current: &docker.Container{
+			ID:    "old-id",
+			Names: []string{"/" + ContainerName},
+			Image: "minio/minio:latest",
+			State: "running",
+			Ports: []docker.ContainerPort{{Private: internalPort, Public: 9000, Protocol: "tcp"}},
+		},
+	}
+	var logBuf bytes.Buffer
+	env := accessory.Env{
+		Docker:        fd,
+		Network:       "multienv",
+		HostBoundPort: 9000,
+		Log:           func(format string, args ...any) { logBuf.WriteString(format + "\n") },
+	}
+
+	if _, err := ensureContainer(context.Background(), env, nil); err != nil {
+		t.Fatalf("ensureContainer: %v", err)
+	}
+	wantSeq := []string{
+		"inspect:" + ContainerName,
+		"remove:old-id",
+		"pull",
+		"create:" + ContainerName,
+		"start:new-" + ContainerName,
+	}
+	if !equalSeq(fd.calls, wantSeq) {
+		t.Errorf("call sequence = %v, want %v", fd.calls, wantSeq)
+	}
+	if !strings.Contains(logBuf.String(), "image changed") {
+		t.Errorf("expected image-change log line, got: %s", logBuf.String())
+	}
+	if fd.lastSpec.Image != Image {
+		t.Errorf("new container image = %q, want %q", fd.lastSpec.Image, Image)
+	}
+}
+
 func TestEnsureBucket_CreatesWhenMissing(t *testing.T) {
 	t.Parallel()
 	fd := &fakeDocker{}
@@ -545,7 +635,7 @@ func TestEnsureBucket_CreatesWhenMissing(t *testing.T) {
 	if !created {
 		t.Error("expected created=true on first call")
 	}
-	wantSeq := []string{"stat:local/uploads", "mb:local/uploads"}
+	wantSeq := []string{"HEAD /uploads", "PUT /uploads"}
 	if !equalSeq(fd.calls, wantSeq) {
 		t.Errorf("call sequence = %v, want %v", fd.calls, wantSeq)
 	}
@@ -553,7 +643,7 @@ func TestEnsureBucket_CreatesWhenMissing(t *testing.T) {
 
 func TestEnsureBucket_NoOpWhenExists(t *testing.T) {
 	t.Parallel()
-	fd := &fakeDocker{existingMcs: map[string]bool{"local/uploads": true}}
+	fd := &fakeDocker{buckets: map[string]bool{"/uploads": true}}
 	env := accessory.Env{Docker: fd, Log: func(string, ...any) {}}
 	created, err := ensureBucket(context.Background(), env, "id", "uploads")
 	if err != nil {
@@ -562,7 +652,7 @@ func TestEnsureBucket_NoOpWhenExists(t *testing.T) {
 	if created {
 		t.Error("expected created=false when bucket already present")
 	}
-	wantSeq := []string{"stat:local/uploads"}
+	wantSeq := []string{"HEAD /uploads"}
 	if !equalSeq(fd.calls, wantSeq) {
 		t.Errorf("call sequence = %v, want %v", fd.calls, wantSeq)
 	}

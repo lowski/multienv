@@ -16,7 +16,7 @@ There are no per-project config files. Everything multienv does is driven by lab
 - [Accessories](#accessories)
   - [proxy: HTTPS reverse proxy (Caddy)](#proxy-https-reverse-proxy-caddy)
   - [postgres: PostgreSQL 18](#postgres-postgresql-18)
-  - [s3: object storage (MinIO)](#s3-object-storage-minio)
+  - [s3: object storage (RustFS)](#s3-object-storage-rustfs)
 - [Command reference](#command-reference)
 - [Running as a container](#running-as-a-container)
 - [Where multienv keeps state](#where-multienv-keeps-state)
@@ -127,9 +127,9 @@ postgres://postgres:postgres@127.0.0.1:5432/<dbname>
 
 Published on `127.0.0.1:5432` by default.
 
-### s3: object storage (MinIO)
+### s3: object storage (RustFS)
 
-A shared S3-compatible store with a bucket per service. Credentials are always `minio:minio123`.
+A shared S3-compatible store backed by [RustFS](https://rustfs.com), with a bucket per service. Credentials are always `rustfsadmin:rustfsadmin`.
 
 | Label | Required | Description |
 |---|---|---|
@@ -141,10 +141,10 @@ Connect from your app:
 
 ```
 # from another container on the multienv network
-http://minioadmin:minioadmin@multienv-s3:9000
+http://rustfsadmin:rustfsadmin@multienv-s3:9000
 
 # from your host machine
-http://minioadmin:minioadmin@127.0.0.1:9000
+http://rustfsadmin:rustfsadmin@127.0.0.1:9000
 ```
 
 Published on `127.0.0.1:9000` by default.
